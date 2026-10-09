@@ -1,0 +1,11 @@
+# 개인 파일·작업 파일이 실수로 올라가지 않게
+*.pdf
+*.zip
+*.mp4
+*.png
+*.jpg
+*.webp
+*.html
+*.bak
+desktop.ini
+Thumbs.db
