@@ -1,7 +1,7 @@
 //@name wall_painter
-//@display-name 🖌️ Wall Painter v0.9.24
+//@display-name 🖌️ Wall Painter v0.9.25
 //@api 3.0
-//@version 0.9.24
+//@version 0.9.25
 //@update-url https://raw.githubusercontent.com/ballpotato/risu-plugins/main/wall-painter/wall_painter.js
 //@description 채팅 상황에 맞춰 채팅 배경을 자동으로 바꿉니다. 메인모델 태그 주입 + 보조모델 폴백 + 봇 에셋 자동 태깅.
 
@@ -21,7 +21,7 @@
   // ─────────────────────────────────────────────────────────────
   // 상수
   // ─────────────────────────────────────────────────────────────
-  const VERSION = '0.9.24';             // 머리말 //@version과 맞출 것
+  const VERSION = '0.9.25';             // 머리말 //@version과 맞출 것
   const PREFIX = 'autobg_';                 // 로컬 저장소는 모든 플러그인이 공유하므로 접두사 필수
   const KEY_SETTINGS = PREFIX + 'settings';
   const KEY_META = PREFIX + 'meta';         // 이미지 메타데이터 목록 (이미지 데이터 제외)
