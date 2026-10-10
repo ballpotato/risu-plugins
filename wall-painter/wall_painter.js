@@ -1,7 +1,7 @@
 //@name wall_painter
-//@display-name 🖌️ Wall Painter v0.9.25
+//@display-name 🖌️ Wall Painter v0.9.26
 //@api 3.0
-//@version 0.9.25
+//@version 0.9.26
 //@update-url https://raw.githubusercontent.com/ballpotato/risu-plugins/main/wall-painter/wall_painter.js
 //@description 채팅 상황에 맞춰 채팅 배경을 자동으로 바꿉니다. 메인모델 태그 주입 + 보조모델 폴백 + 봇 에셋 자동 태깅.
 
@@ -21,7 +21,7 @@
   // ─────────────────────────────────────────────────────────────
   // 상수
   // ─────────────────────────────────────────────────────────────
-  const VERSION = '0.9.25';             // 머리말 //@version과 맞출 것
+  const VERSION = '0.9.26';             // 머리말 //@version과 맞출 것
   const PREFIX = 'autobg_';                 // 로컬 저장소는 모든 플러그인이 공유하므로 접두사 필수
   const KEY_SETTINGS = PREFIX + 'settings';
   const KEY_META = PREFIX + 'meta';         // 이미지 메타데이터 목록 (이미지 데이터 제외)
@@ -77,7 +77,8 @@
     disabledChars: [],     // 이 플러그인을 끈 캐릭터 chaId 목록
     scannedChars: [],      // 에셋을 이미 가져온 캐릭터 chaId 목록
     selfBgChars: [],       // 답변에 자체 배경 출력(상태창·이미지)이 있는 봇 chaId 목록 (그 배경을 그대로 따라감)
-    bgVarByChar: {},       // 봇이 배경 키를 담는 채팅 변수 이름 { chaId: '$mp_bg' } (처음 찾았을 때 기억)
+    bgVarByChar: {},
+    bgNameRules: {},       // 캐릭터별로 사용자가 추가한 배경 이름 규칙 { chaId: ['b_', 'scene'] }       // 봇이 배경 키를 담는 채팅 변수 이름 { chaId: '$mp_bg' } (처음 찾았을 때 기억)
   };
 
   // ─────────────────────────────────────────────────────────────
@@ -1333,6 +1334,35 @@
     return results.filter((r) => r.location);
   }
 
+  // 이름 규칙 태깅: 기본(bg·background·배경) + 사용자가 추가한 말.
+  // 추가한 말은 이름 맨 앞이나 _ - 공백 . / 뒤에 오면 배경으로 보고, 장소 이름을 만들 때는 그 말을 뺌.
+  function tagByNameRules(assets, extra = []) {
+    const kws = extra.map((k) => String(k).trim().toLowerCase()).filter(Boolean);
+    const res = kws.map((k) => new RegExp('(^|[_\\-\\s./])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    const out = [];
+    for (const a of assets) {
+      const n = String(a.name).toLowerCase();
+      let nm = a.name;
+      if (!/(^|[_\-\s.])(bg|background|backgrounds|배경)([_\-\s.]|$)/i.test(n)) {
+        const k = res.findIndex((re) => re.test(n));
+        if (k < 0) continue;
+        const i = n.indexOf(kws[k]);
+        nm = a.name.slice(0, i) + ' ' + a.name.slice(i + kws[k].length);
+      }
+      const g = guessTagsFromName(nm, true);
+      if (g.location) out.push({ asset: a, ...g });
+    }
+    return out;
+  }
+  // 토큰 어림: 영문·숫자·기호 4글자당 1, 그 밖의 글자(한글·일본어 등)는 1글자당 약 1.2
+  function estTokens(str) {
+    let a = 0;
+    let o = 0;
+    for (const ch of String(str)) (ch.charCodeAt(0) < 128 ? a++ : o++);
+    return Math.ceil(a / 4 + o * 1.2);
+  }
+  const fmtTok = (n) => (n >= 10000 ? `${(n / 10000).toFixed(1)}만` : n.toLocaleString());
+
   // 보조모델이 실패하면 이름에 bg/background/배경이 들어간 에셋만 파일명 규칙으로 태깅
   function fallbackTagByName(assets) {
     return assets
@@ -1356,39 +1386,96 @@
       let auxOk = true;
       let processed = [];   // 이번에 확인을 끝낸 에셋 (다음 스캔에서 제외)
       if (fresh.length) {
-        // 1) 이름에 bg/background/배경이 든 에셋은 보조모델 없이 파일명 규칙으로 바로 태깅
-        const ruleHits = fallbackTagByName(fresh);
-        const ruleSet = new Set(ruleHits.map((r) => r.asset.path));
-        const rest = fresh.filter((a) => !ruleSet.has(a.path));
+        // 1) 이름 규칙(bg·배경 + 이 캐릭터에 추가한 규칙)에 맞는 에셋은 보조모델 없이 바로 태깅
+        let kw = [...(settings.bgNameRules?.[char.chaId] || [])];
+        let ruleHits = [];
+        let rest = [];
+        const split = () => {
+          ruleHits = tagByNameRules(fresh, kw);
+          const set = new Set(ruleHits.map((r) => r.asset.path));
+          rest = fresh.filter((a) => !set.has(a.path));
+        };
+        split();
+        // 2) 나머지는 보조모델로 확인할지 물어봄 (호출 횟수·토큰 어림, 규칙 추가 후 다시 찾기)
+        let choice = 'rule';
+        if (rest.length) {
+          const estimate = () => {
+            const sys = buildTaggingPrompt(char.chaId);
+            const sysTok = estTokens(sys);
+            let inTok = 0;
+            let calls = 0;
+            for (let s0 = 0; s0 < rest.length; s0 += AUX_NAMES_PER_CALL) {
+              const chunk = rest.slice(s0, s0 + AUX_NAMES_PER_CALL);
+              inTok += sysTok + estTokens(`Bot: ${char.name}\nAsset names:\n` + chunk.map((a, k) => `${s0 + k}: ${a.name}`).join('\n')) + 8;
+              calls++;
+            }
+            return { calls, inTok, outMax: rest.length * 32 + calls * 4 };   // 출력: 전부 배경일 때 이름당 JSON 한 줄
+          };
+          const sample = (list) => list.slice(0, 8).map((a) => `<code>${esc(a.name)}</code>`).join(' ') + (list.length > 8 ? ' …' : '');
+          const body = () => {
+            const e = estimate();
+            return `<p>새 에셋 <b>${fresh.length}개</b> 중 배경 이름 규칙에 맞는 <b>${ruleHits.length}개</b>는 보조모델 없이 바로 가져옵니다.</p>
+              ${rest.length ? `<p>나머지 <b>${rest.length}개</b>의 이름을 보조모델에 보내 배경인지 판단할 수 있습니다.<br>
+              <b>보조모델 약 ${e.calls}번 호출</b> · 입력 약 ${fmtTok(e.inTok)} 토큰, 출력 최대 약 ${fmtTok(e.outMax)} 토큰</p>
+              <p class="hint">어림값입니다. 한글·일본어 이름이 많으면 실제보다 적게 나올 수 있습니다.</p>` : '<p>남은 에셋이 없습니다. 보조모델을 부르지 않습니다.</p>'}
+              <div style="margin-top:10px;padding:10px 12px;border:1px solid #2c313d;border-radius:12px;background:#171a21">
+                <div style="font-weight:700">배경 이름 규칙 추가</div>
+                <div class="hint">이 봇의 배경 파일명에 공통으로 붙는 말을 쉼표로 적고 다시 찾으십시오. 이름 맨 앞이나 _·-·공백 뒤에 오면 배경으로 봅니다. 예: b_, scene, place</div>
+                <div style="display:flex;gap:6px;margin-top:8px"><input type="text" id="scan-kw" value="${esc(kw.join(', '))}" placeholder="b_, scene" style="flex:1;min-width:0;padding:6px 10px;border-radius:8px;border:1px solid #3a4150;background:#11131a;color:#e6e6ea">
+                  <button class="chip blue" id="scan-kw-apply" type="button">다시 찾기</button></div>
+                ${rest.length ? `<div class="hint" style="margin-top:8px">남은 이름 예시: ${sample(rest)}</div>` : ''}
+                ${ruleHits.length ? `<div class="hint" style="margin-top:4px">규칙으로 찾은 예시: ${sample(ruleHits.map((r) => r.asset))}</div>` : ''}
+              </div>
+              <p class="hint" style="margin-top:8px">확인한 에셋은 기억해서 다음 스캔에서는 다시 보내지 않습니다.</p>`;
+          };
+          const labels = () => {
+            const e = estimate();
+            return [ruleHits.length ? `규칙으로 찾은 ${ruleHits.length}개만` : '취소', rest.length ? `보조모델로 확인 (${e.calls}번)` : `${ruleHits.length}개 가져오기`];
+          };
+          const [l0, l1] = labels();
+          const pending = showDialog({
+            title: '나머지 에셋도 보조모델로 확인할까요?',
+            body: body(),
+            buttons: [{ label: l0, value: 'rule' }, { label: l1, value: 'aux', cls: 'sel' }],
+          });
+          // 대화상자를 닫지 않고 규칙만 바꿔 다시 찾기
+          const bindApply = () => {
+            const btn = document.getElementById('scan-kw-apply');
+            const input = document.getElementById('scan-kw');
+            if (!btn || !input) return;
+            const apply = async () => {
+              kw = [...new Set(input.value.split(',').map((x) => x.trim()).filter(Boolean))];
+              settings.bgNameRules = { ...(settings.bgNameRules || {}), [char.chaId]: kw };
+              await saveSettings();
+              split();
+              setDialogBody(body());
+              const [b0, b1] = labels();
+              const btns = document.querySelectorAll('.dlg-back .dlg-btns [data-i]');
+              if (btns[0]) btns[0].textContent = b0;
+              if (btns[1]) btns[1].textContent = b1;
+              bindApply();
+            };
+            btn.onclick = apply;
+            input.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); apply(); } };
+          };
+          bindApply();
+          choice = await pending;
+          if (choice === null) return null;   // 바깥을 눌러 닫으면 취소
+          if (choice === 'rule' && !ruleHits.length) return null;
+        }
         tagged = ruleHits;
         processed = ruleHits.map((r) => r.asset);
-        // 2) 나머지는 보조모델로 확인할지 물어봄 (호출 횟수 안내)
-        if (rest.length) {
-          const calls = Math.ceil(rest.length / AUX_NAMES_PER_CALL);
-          const choice = await showDialog({
-            title: '나머지 에셋도 보조모델로 확인할까요?',
-            body: `<p>새 에셋 <b>${fresh.length}개</b> 중 이름에 bg·배경이 들어간 <b>${ruleHits.length}개</b>는 파일명 규칙으로 바로 가져옵니다.</p>
-              <p>나머지 <b>${rest.length}개</b>의 이름을 보조모델에 보내 배경인지 판단할 수 있습니다. <b>보조모델 약 ${calls}번 호출</b></p>
-              <p class="hint">확인한 에셋은 기억해서 다음 스캔에서는 다시 보내지 않습니다.</p>`,
-            buttons: [
-              { label: ruleHits.length ? `규칙으로 찾은 ${ruleHits.length}개만` : '취소', value: 'rule' },
-              { label: `보조모델로 확인 (${calls}번)`, value: 'aux', cls: 'sel' },
-            ],
-          });
-          if (choice === 'aux') {
-            try {
-              tagged = [...ruleHits, ...(await autoTagByName(rest, char))];
-              processed = fresh;
-            } catch (e) {
-              console.warn('[Wall Painter] 자동 태깅 실패, 파일명 규칙 결과만 사용', e);
-              auxOk = false;
-              note = '보조모델 확인에 실패해서 이름에 bg·배경이 들어간 에셋만 파일명 규칙으로 가져왔습니다. 보조모델 문제를 해결한 뒤 다시 스캔하면 나머지 에셋도 확인합니다.';
-            }
-          } else if (!ruleHits.length) {
-            return null;   // 취소
-          } else {
-            note = `나머지 ${rest.length}개 에셋은 확인하지 않았습니다. 다시 스캔하면 다시 물어봅니다.`;
+        if (choice === 'aux' && rest.length) {
+          try {
+            tagged = [...ruleHits, ...(await autoTagByName(rest, char))];
+            processed = fresh;
+          } catch (e) {
+            console.warn('[Wall Painter] 자동 태깅 실패, 파일명 규칙 결과만 사용', e);
+            auxOk = false;
+            note = '보조모델 확인에 실패해서 이름 규칙에 맞는 에셋만 가져왔습니다. 보조모델 문제를 해결한 뒤 다시 스캔하면 나머지 에셋도 확인합니다.';
           }
+        } else if (rest.length) {
+          note = `나머지 ${rest.length}개 에셋은 확인하지 않았습니다. 다시 스캔하면 다시 물어봅니다.`;
         }
         if (processed.length) {
           for (const a of processed) checked.add(a.path);
